@@ -101,6 +101,7 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                 print_msg('-'*console_width)
                 break
     
+    # if we have tensorboard enabled, we can use this to log the metrics
     if writer:
         # Evaluate the character error rate
         # Compute the char error rate 
@@ -123,8 +124,10 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
 
 def get_all_sentences(ds, lang):
     for item in ds:
+        # each item in the dataset has a pair of english and italian sentences and each time you want to tokenize the lang you need
         yield item['translation'][lang]
 
+# just to access to the tokenizer to split the sentence
 def get_or_build_tokenizer(config, ds, lang):
     tokenizer_path = Path(config['tokenizer_file'].format(lang))
     if not Path.exists(tokenizer_path):
@@ -232,6 +235,7 @@ def train_model(config):
 
             # Run the tensors through the encoder, decoder and the projection layer
             encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
+            # always the last feature map of the last encoder use in all of the decoders
             decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
             proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
 
@@ -271,4 +275,5 @@ def train_model(config):
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
     config = get_config()
+    # Train with scratch
     train_model(config)

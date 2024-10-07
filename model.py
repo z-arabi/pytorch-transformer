@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 import math
 
+'''
+Unlike batch normalization, which uses the statistics (mean and variance) across the entire batch, 
+layer normalization computes the mean and variance along the feature dimension for each individual sample.
+For each feature in the featuremap, the mean and variance are calculated across all batch samples.
+(batch_size, channels, height, width) >> x.mean(dim=(0, 2, 3), keepdim=True) >> (1, channels, 1, 1)
+'''
 class LayerNormalization(nn.Module):
 
     def __init__(self, features: int, eps:float=10**-6) -> None:
@@ -12,17 +18,18 @@ class LayerNormalization(nn.Module):
 
     def forward(self, x):
         # x: (batch, seq_len, hidden_size)
-         # Keep the dimension for broadcasting
+        # Keep the dimension for broadcasting, for each item calculate the mean and std
         mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
         # Keep the dimension for broadcasting
         std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # eps is to prevent dividing by zero or when std is very small
+        # eps is to prevent dividing by zero or when std is very small > normalize each sample based on its statistics
         return self.alpha * (x - mean) / (std + self.eps) + self.bias
 
 class FeedForwardBlock(nn.Module):
 
     def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
         super().__init__()
+        # nn.Linear has the bias as True for the default value
         self.linear_1 = nn.Linear(d_model, d_ff) # w1 and b1
         self.dropout = nn.Dropout(dropout)
         self.linear_2 = nn.Linear(d_ff, d_model) # w2 and b2
@@ -31,12 +38,15 @@ class FeedForwardBlock(nn.Module):
         # (batch, seq_len, d_model) --> (batch, seq_len, d_ff) --> (batch, seq_len, d_model)
         return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
 
+# Your(token) > Id(105) shows the index and position in the vocavulary > Embed(embedding size which is d_model): each vector represents a word
+# the input of embedding is int, and the each token in the seq_len should have one id assigned whithin the range of the vocab_size
 class InputEmbeddings(nn.Module):
 
     def __init__(self, d_model: int, vocab_size: int) -> None:
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
+        # Learnable layer
         self.embedding = nn.Embedding(vocab_size, d_model)
 
     def forward(self, x):
@@ -44,6 +54,7 @@ class InputEmbeddings(nn.Module):
         # Multiply by sqrt(d_model) to scale the embeddings according to the paper
         return self.embedding(x) * math.sqrt(self.d_model)
     
+# add the positional encoding to the input embeddings, so the shape of the positional encoding should be the same as the input embeddings
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
@@ -57,16 +68,19 @@ class PositionalEncoding(nn.Module):
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1) # (seq_len, 1)
         # Create a vector of shape (d_model)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)) # (d_model / 2)
-        # Apply sine to even indices
+        # Apply sine to even indices: (seq_len, 1) * (d_model/2) = (seq_len, d_model/2)
         pe[:, 0::2] = torch.sin(position * div_term) # sin(position * (10000 ** (2i / d_model))
-        # Apply cosine to odd indices
+        # Apply cosine to odd indices: (seq_len, 1) * (d_model/2) = (seq_len, d_model/2)
         pe[:, 1::2] = torch.cos(position * div_term) # cos(position * (10000 ** (2i / d_model))
         # Add a batch dimension to the positional encoding
         pe = pe.unsqueeze(0) # (1, seq_len, d_model)
-        # Register the positional encoding as a buffer
+        # Register the positional encoding as a buffer > when you want to save the value in the model while saving it But iis not the parameter and not learnable
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        # x: batch, seq_len, d_model > for all batches we have a unique positional encoding
+        # seq_len shows the position of the token in the sentence
+        # the position encoding is not learnable, so we don't need to calculate the gradient
         x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False) # (batch, seq_len, d_model)
         return self.dropout(x)
 
@@ -78,6 +92,7 @@ class ResidualConnection(nn.Module):
             self.norm = LayerNormalization(features)
     
         def forward(self, x, sublayer):
+            # A bit different in the order from the paper, first normalization then multi-head attention, then residual connection and dropout
             return x + self.dropout(sublayer(self.norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
@@ -90,23 +105,30 @@ class MultiHeadAttentionBlock(nn.Module):
         assert d_model % h == 0, "d_model is not divisible by h"
 
         self.d_k = d_model // h # Dimension of vector seen by each head
+        # we don't need bias here
         self.w_q = nn.Linear(d_model, d_model, bias=False) # Wq
         self.w_k = nn.Linear(d_model, d_model, bias=False) # Wk
         self.w_v = nn.Linear(d_model, d_model, bias=False) # Wv
         self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo
         self.dropout = nn.Dropout(dropout)
 
+    # to access for the attention maps
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):
         d_k = query.shape[-1]
         # Just apply the formula from the paper
         # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
+        # @ is like torch.matmul > calculate the sacel product > (batch, h, seq_len, d_k) @ (batch, h, d_k, seq_len) = (batch, h, seq_len, seq_len)
+        # for avoiding of having a loop for each head, we can use the matrix multiplication
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
             # Write a very low value (indicating -inf) to the positions where mask == 0
+            # The softmax function return 0.5 for the values of zero and 0 for the values of -inf > zero shows no relation between the tokens so the output should be zero
             attention_scores.masked_fill_(mask == 0, -1e9)
+        # apply for each row independently for the lasr dimension
         attention_scores = attention_scores.softmax(dim=-1) # (batch, h, seq_len, seq_len) # Apply softmax
         if dropout is not None:
+            # Randomly Zeroed Elements: Approximately 10% of the elements in attention_scores will be set to zero if the dropout probability (p) is 0.1.
             attention_scores = dropout(attention_scores)
         # (batch, h, seq_len, seq_len) --> (batch, h, seq_len, d_k)
         # return attention scores which can be used for visualization
@@ -118,6 +140,7 @@ class MultiHeadAttentionBlock(nn.Module):
         value = self.w_v(v) # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
 
         # (batch, seq_len, d_model) --> (batch, seq_len, h, d_k) --> (batch, h, seq_len, d_k)
+        # use view for the reshaping
         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
@@ -127,6 +150,7 @@ class MultiHeadAttentionBlock(nn.Module):
         
         # Combine all the heads together
         # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
+        # A tensor is considered contiguous if its elements are stored in a single, contiguous block of memory. 
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
 
         # Multiply by Wo
@@ -142,6 +166,8 @@ class EncoderBlock(nn.Module):
         self.residual_connections = nn.ModuleList([ResidualConnection(features, dropout) for _ in range(2)])
 
     def forward(self, x, src_mask):
+        # features, ans the sublayer which is the MultiheadAttentionBlock
+        # sublayer is a function that takes x as input and returns the output of the MultiheadAttentionBlock
         x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
         x = self.residual_connections[1](x, self.feed_forward_block)
         return x
@@ -250,6 +276,7 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
         decoder_blocks.append(decoder_block)
     
     # Create the encoder and decoder
+    # from the lists > create a moduleList
     encoder = Encoder(d_model, nn.ModuleList(encoder_blocks))
     decoder = Decoder(d_model, nn.ModuleList(decoder_blocks))
     
